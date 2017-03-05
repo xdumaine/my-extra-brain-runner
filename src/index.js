@@ -1,88 +1,128 @@
 const APP_ID = undefined; //eslint-disable-line
 const AWS = require('aws-sdk');
+const dynamodb = new AWS.DynamoDB();
 import Promise from 'bluebird';
+import moment from 'moment';
 
-function sendMessage ({action, response}) {
-  const duration = this.computeDuration(action);
-  const durationString = `${duration.humanize()} from now`;
-
-  const done = `Your reminder to ${action.reminder} is set for ${durationString}.`;
+function sendMessage ({ phoneNumber, reminder }) {
+  if (phoneNumber[0] !== '+') {
+    phoneNumber = `+1${phoneNumber}`;
+  }
   const params = {
-    Message: `RemindMe: "${action.reminder}" for ${durationString} from now.`,
-    PhoneNumber: '+17408565809'
+    Message: `RemindMe: "${reminder}".`,
+    PhoneNumber: phoneNumber
   };
   const sns = new AWS.SNS();
-  sns.publish(params, function (err, data) {
-    if (err) {
-      console.log(err);
-      response.tell('Sorry, sending the reminder failed.');
-    } else {
-      response.tell(done);
-    }
+  console.log('sending message', params);
+  return new Promise((resolve, reject) => {
+    sns.publish(params, (err) => {
+      if (err) {
+        console.log('Failed to send message', err);
+        return reject(err);
+      }
+      console.log('Message send successfully');
+      resolve();
+    });
   });
 }
 
+function lookupPhoneNumber (userId) {
+  const params = {
+    Key: {
+      'userId': {
+        S: userId
+      }
+    },
+    TableName: 'RemindMeNumbers'
+  };
+
+  return new Promise((resolve, reject) => {
+    dynamodb.getItem(params, (err, data) => {
+      if (err) {
+        return reject(err);
+      }
+      console.log('Pulled user from dynamo', data);
+      if (!data.Item || !data.Item.phoneNumber || !data.Item.phoneNumber.S) {
+        return reject(new Error('Cannot send reminder. User has no phone number stored'));
+      }
+      return resolve(data.Item && data.Item.phoneNumber && data.Item.phoneNumber.S);
+    });
+  });
+}
 function processReminder (reminder) {
-  console.log(`processing reminder`, reminder);
-  return Promise.resolve();
+  console.log('processing reminder', reminder);
+  lookupPhoneNumber(reminder.userId.S)
+    .then((phoneNumber) => {
+      return sendMessage({ phoneNumber, reminder: reminder.reminder.S });
+    })
+    .then(() => {
+      return deleteReminder(reminder);
+    });
 }
 
 function processReminders (reminders) {
-  if (!reminders.Messages || reminders.Messages.length === 0) {
-    console.log(`No pending reminders to process`);
-    return []; // empty array of promises
-  }
-  console.log(`processing ${reminders.Messages.length} pending reminders`);
+  return reminders.map((reminder) => {
+    return processReminder(reminder);
+  });
+}
 
-  // map each item to a promise
-  return reminders.Messages.map((message) => {
-    return processReminder(message);
+function deleteReminder (reminder) {
+  const params = {
+    TableName: 'RemindMeReminders',
+    Key: {
+      reminderId: {
+        S: reminder.reminderId.S
+      },
+      ttl: {
+        S: reminder.ttl.S
+      }
+    }
+  };
+
+  console.log('attempting to delete item', params);
+  return new Promise((resolve, reject) => {
+    dynamodb.deleteItem(params, (err) => {
+      if (err) {
+        console.log('Failed to delete item', err);
+        return reject(err);
+      }
+      return resolve();
+    });
   });
 }
 
 function getPendingReminders () {
-  const sqs = new AWS.SQS();
-  const queueURL = 'https://sqs.us-east-1.amazonaws.com/920018820316/remindMeReminders';
-
+  const now = moment();
+  const end = now.toISOString();
   const params = {
-    AttributeNames: [
-      'SentTimestamp'
-    ],
-    MaxNumberOfMessages: 1,
-    MessageAttributeNames: [
-      'All'
-    ],
-    QueueUrl: queueURL,
-    VisibilityTimeout: 0,
-    WaitTimeSeconds: 0
+    TableName: 'RemindMeReminders',
+    FilterExpression: '#ttl < :end',
+    ExpressionAttributeNames: {
+      '#ttl': 'ttl'
+    },
+    ExpressionAttributeValues: {
+      ':end': { S: end }
+    }
   };
-
-  return Promise.fromCallback(callback => sqs.receiveMessage(params, callback));
-
-//   sqs.receiveMessage(params, function (err, data) {
-//     if (err) {
-//       console.log('error receiving messages from sqs', err);
-//     } else {
-//       var deleteParams = {
-//         QueueUrl: queueURL,
-//         ReceiptHandle: data.Messages[0].ReceiptHandle
-//       };
-//       // sqs.deleteMessage(deleteParams, function (err, data) {
-//       //   if (err) {
-//       //     console.log('error deleting messages from sqs', err);
-//       //   } else {
-//       //     console.log('deleted message from sqs', data);
-//       //   }
-//       // });
-//     }
-//   });
+  console.log('Scanning for reminders', params);
+  return new Promise((resolve, reject) => {
+    dynamodb.scan(params, (err, results) => {
+      if (err) {
+        return reject(err);
+      }
+      return resolve(results);
+    });
+  });
 }
 
 function processQueue () {
   return getPendingReminders()
     .then((reminders) => {
       console.log('Fetched queued reminders', reminders);
-      processReminders(reminders);
+      processReminders(reminders.Items);
+    })
+    .catch((err) => {
+      console.log('failed to process queue', err);
     });
 }
 
